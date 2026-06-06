@@ -1,0 +1,14 @@
+# Rust build artifacts (the release .node is produced on the windows-latest CI runner).
+/target/
+
+# napi-rs build outputs. The committed prebuilt under prebuilds/ is the ONE exception:
+# it is this package's distribution unit (consumed by GoofCord's copyNativeModules() via
+# the optionalDependency github ref), so it is tracked via the negation below. The CI
+# commit-back step also force-adds it (`git add -f`) as a belt-and-suspenders backstop.
+*.node
+!prebuilds/**/*.node
+index.js
+index.d.ts
+
+# Node deps for the crate's own (Windows-only) build
+/node_modules/

@@ -1,0 +1,56 @@
+name: Build prebuilt
+
+# Manual trigger: build the win32-x64 prebuilt .node and commit it back into the repo.
+# Single target only (win32-x64, D-10); win32-arm64 is a noted fast-follow.
+on:
+  workflow_dispatch
+
+permissions:
+  contents: write # required to commit the prebuilt back to the repo
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build .node
+        shell: pwsh
+        run: |
+          bun install
+          bun x napi build --release --target x86_64-pc-windows-msvc
+          # napi emits `wasapi-loopback.win32-x64-msvc.node` (or similar). Normalize to the
+          # EXACT glob-matched name `wasapi-loopback-win32-x64.node` (must contain BOTH win32
+          # AND x64 — required by GoofCord's nativeImport.ts substring glob) at the precise
+          # path GoofCord's build.ts reads: prebuilds/windows-x86_64/.
+          $node = Get-ChildItem -Path . -Filter "*.node" -Recurse | Select-Object -First 1
+          if (-not $node) { Write-Error "napi build produced no .node"; exit 1 }
+          New-Item -ItemType Directory -Force -Path prebuilds/windows-x86_64 | Out-Null
+          Copy-Item $node.FullName prebuilds/windows-x86_64/wasapi-loopback-win32-x64.node -Force
+          Write-Host "wasapi addon built: $($node.FullName) -> prebuilds/windows-x86_64/wasapi-loopback-win32-x64.node"
+
+      - name: Commit prebuilt
+        shell: pwsh
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # .gitignore ignores *.node; the prebuilds/ negation is the intended exception, and
+          # `-f` is the belt-and-suspenders backstop so the prebuilt is always staged.
+          git add -f prebuilds/windows-x86_64/wasapi-loopback-win32-x64.node
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "ci: prebuilt win32-x64"
+            git push
+          } else {
+            Write-Host "No prebuild change to commit."
+          }

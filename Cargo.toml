@@ -1,0 +1,54 @@
+[package]
+name = "wasapi-loopback"
+version = "0.1.0"
+edition = "2021"
+# MSRV 1.82.0 — the minimum supported Rust version of the `windows` crate 0.62.x.
+rust-version = "1.82.0"
+description = "Clean-room WASAPI process-tree EXCLUDE loopback capture as a napi-rs .node addon (Windows)."
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = "3.9.0"
+napi-derive = "3.5.6"
+# `#[implement(...)]` expands to absolute `::windows_core::` paths, so windows-core must be
+# a direct dependency (the `windows` crate re-exports it as `windows::core`, but the macro
+# needs the crate name `windows_core` resolvable at the crate root).
+windows-core = "0.62"
+
+# Win32 bindings for the public WASAPI Application Loopback API surface.
+# Feature-gated to keep build size/time down — these modules provide:
+#   Win32_Media_Audio                  -> IAudioClient / IAudioCaptureClient / ActivateAudioInterfaceAsync /
+#                                         AUDIOCLIENT_ACTIVATION_PARAMS / AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS /
+#                                         AUDCLNT_STREAMFLAGS_* / WAVEFORMATEXTENSIBLE / AUDCLNT_BUFFERFLAGS_SILENT
+#   Win32_System_Com                   -> CoInitializeEx / CoUninitialize / BLOB / the IUnknown vtable
+#   Win32_Foundation                   -> S_OK / E_FAIL / HANDLE / WAIT_OBJECT_0 / ERROR_PROC_NOT_FOUND
+#   Win32_System_Threading             -> CreateEventW / WaitForSingleObject / SetEvent / INFINITE
+#   Win32_System_LibraryLoader         -> LoadLibraryW / GetProcAddress (dynamic activation-entry resolution)
+#   Win32_Media_KernelStreaming        -> WAVE_FORMAT_EXTENSIBLE (the wFormatTag value)
+#   Win32_Media_Multimedia             -> KSDATAFORMAT_SUBTYPE_IEEE_FLOAT (the WAVEFORMATEXTENSIBLE SubFormat)
+#   Win32_System_Variant               -> VT_BLOB / VARENUM (the PROPVARIANT discriminant)
+#   Win32_System_Com_StructuredStorage -> PROPVARIANT (carries AUDIOCLIENT_ACTIVATION_PARAMS into the activation)
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Variant",
+    "Win32_System_Com_StructuredStorage",
+]
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true

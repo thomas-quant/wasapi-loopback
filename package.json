@@ -1,0 +1,35 @@
+{
+  "name": "wasapi-loopback",
+  "version": "0.1.0",
+  "description": "Clean-room WASAPI process-tree EXCLUDE loopback capture (.node addon, Windows only).",
+  "license": "MIT",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thomas-quant/wasapi-loopback.git"
+  },
+  "homepage": "https://github.com/thomas-quant/wasapi-loopback#readme",
+  "files": [
+    "prebuilds",
+    "src",
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "NOTICE",
+    "README.md",
+    "LICENSE"
+  ],
+  "napi": {
+    "name": "wasapi-loopback"
+  },
+  "scripts": {
+    "build": "napi build --release --target x86_64-pc-windows-msvc"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.7.0"
+  },
+  "engines": {
+    "node": ">= 20"
+  }
+}
