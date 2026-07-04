@@ -31,28 +31,43 @@ use napi_derive::napi;
 
 // The `#[implement]` macro emits absolute `::windows_core::` paths, so windows-core is a
 // direct dependency (see Cargo.toml). `windows` also re-exports it as `windows::core`.
-use windows::core::{implement, w, IUnknown, Interface, GUID, HRESULT, PCWSTR};
+use windows::core::{implement, w, IUnknown, Interface, GUID, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_PROC_NOT_FOUND, E_FAIL, HANDLE, S_OK, WAIT_OBJECT_0,
 };
 use windows::Win32::Media::Audio::{
     ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
-    IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    IAudioCaptureClient, IAudioClient, IAudioSessionControl, IAudioSessionControl2,
+    IAudioSessionEnumerator, IAudioSessionManager2, IMMDevice, IMMDeviceCollection,
+    IMMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
     AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
     AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-    WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
+    DEVICE_STATE_ACTIVE, MMDeviceEnumerator, PROCESS_LOOPBACK_MODE,
+    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+    WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0, eConsole, eRender,
 };
 use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+// Endpoint friendly-name property key + the property store interface returned by
+// IMMDevice::OpenPropertyStore (render-endpoint enumeration). PKEY_Device_FriendlyName lives under
+// Win32_Devices_FunctionDiscovery; IPropertyStore under Win32_UI_Shell_PropertiesSystem.
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, BLOB, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, BLOB, CLSCTX_ALL,
+    COINIT_MULTITHREADED, STGM_READ,
+};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject, INFINITE};
-use windows::Win32::System::Variant::VT_BLOB;
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, SetEvent,
+    WaitForSingleObject, INFINITE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
 
 // ─── Hardcoded capture format (the renderer/transport contract) ─────────────────────
 //
@@ -209,25 +224,59 @@ fn process_loopback_entrypoint_present() -> bool {
 
 // ─── Activation ─────────────────────────────────────────────────────────────────────
 
-/// Attempt to activate a process-loopback IAudioClient that EXCLUDES the process tree
-/// rooted at `exclude_root_pid`, initialized to the hardcoded 48k/stereo/f32 format.
+/// Initialize an already-acquired `IAudioClient` to the fixed 48k/stereo/f32 loopback format.
+///
+/// This is the SINGLE Initialize/stream-flags block shared by BOTH client-acquisition paths —
+/// process-tree activation (the magic device) and render-endpoint activation (a real `IMMDevice`).
+/// Routing both through here guarantees the transport format never diverges: shared mode with
+/// `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY` so the engine converts to our hardcoded format (the
+/// deliberate divergence from OBS, which queries the endpoint mix format), plus
+/// `LOOPBACK | EVENTCALLBACK` for the event-driven capture loop. StreamFlags is the SECOND
+/// Initialize parameter — AUTOCONVERTPCM goes HERE, not into hnsPeriodicity (Pitfall 2 / MS
+/// sample bug #196). Returns the raw `Initialize` result; callers collapse `Err` to `Unsupported`.
+unsafe fn initialize_loopback_client(audio_client: &IAudioClient) -> windows::core::Result<()> {
+    let wfx = build_wave_format();
+    let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    audio_client.Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        stream_flags,                 // <-- StreamFlags (2nd param): AUTOCONVERTPCM lives here.
+        0,                            // hnsBufferDuration (engine default in event-driven shared mode)
+        0,                            // hnsPeriodicity (0 for event-driven shared mode)
+        &wfx as *const _ as *const WAVEFORMATEX,
+        None,
+    )
+}
+
+/// Attempt to activate a process-loopback IAudioClient for the process tree rooted at
+/// `target_pid`, in the requested `mode`, initialized to the hardcoded 48k/stereo/f32 format.
+///
+/// `mode` is the ONLY functional divergence between the two capture kinds:
+///   - `EXCLUDE_TARGET_PROCESS_TREE` — capture everything EXCEPT `target_pid`'s tree (the
+///     shipped #46 echo fix: pass the Electron main PID to drop the host's own playback).
+///   - `INCLUDE_TARGET_PROCESS_TREE` — capture ONLY `target_pid`'s tree (app-exclusive share).
+/// Every other step (VT_BLOB guard, async wait, `build_wave_format()` + `AUTOCONVERTPCM`
+/// initialize) is byte-identical across both modes.
 ///
 /// Returns `Activated(client)` on success, or `Unsupported` for ANY failure (missing
 /// entry point, non-S_OK activate result, or COM error) — never panics, never throws.
-unsafe fn activate_exclude_tree(exclude_root_pid: u32) -> ActivationResult {
+unsafe fn activate_process_tree(mode: PROCESS_LOOPBACK_MODE, target_pid: u32) -> ActivationResult {
     // 1. Dynamic-load gate: if the entry point is absent, this build doesn't support it.
     if !process_loopback_entrypoint_present() {
         return ActivationResult::Unsupported;
     }
 
-    // 2. Build the activation params: EXCLUDE the supplied process tree.
+    // 2. Build the activation params for the supplied process tree in the requested mode.
     let mut activation_params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-                TargetProcessId: exclude_root_pid,
-                // EXCLUDE tree: capture everything EXCEPT exclude_root_pid + its children.
-                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+                TargetProcessId: target_pid,
+                // EXCLUDE tree: capture everything EXCEPT target_pid + its children.
+                // INCLUDE tree: capture ONLY target_pid + its children.
+                ProcessLoopbackMode: mode,
             },
         },
     };
@@ -299,25 +348,72 @@ unsafe fn activate_exclude_tree(exclude_root_pid: u32) -> ActivationResult {
         None => return ActivationResult::Unsupported,
     };
 
-    // 7. Initialize: StreamFlags is the SECOND parameter — AUTOCONVERTPCM goes HERE, not
-    //    into hnsPeriodicity (Pitfall 2 / MS sample bug #196). AUTOCONVERTPCM makes the
-    //    shared-mode engine convert to our hardcoded 48k/stereo/f32, so no Rust DSP.
-    let wfx = build_wave_format();
-    let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
-        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    if audio_client
-        .Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            stream_flags,                 // <-- StreamFlags (2nd param): AUTOCONVERTPCM lives here.
-            0,                            // hnsBufferDuration (engine default in event-driven shared mode)
-            0,                            // hnsPeriodicity (0 for event-driven shared mode)
-            &wfx as *const _ as *const WAVEFORMATEX,
-            None,
-        )
-        .is_err()
-    {
+    // 7. Initialize to the fixed 48k/stereo/f32 loopback format via the shared helper — the SAME
+    //    Initialize/stream-flags block the endpoint path uses, so the transport format stays
+    //    byte-identical across both client-acquisition paths. AUTOCONVERTPCM makes the shared-mode
+    //    engine convert to our hardcoded format, so no Rust DSP.
+    if initialize_loopback_client(&audio_client).is_err() {
+        return ActivationResult::Unsupported;
+    }
+
+    ActivationResult::Activated(audio_client)
+}
+
+/// Thin EXCLUDE wrapper: preserves the legacy `start` call site (the shipped #211 echo fix)
+/// byte-for-byte unchanged — EXCLUDE the process tree rooted at `exclude_root_pid`.
+#[inline]
+unsafe fn activate_exclude_tree(exclude_root_pid: u32) -> ActivationResult {
+    activate_process_tree(
+        PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+        exclude_root_pid,
+    )
+}
+
+/// Attempt to activate a render-endpoint loopback `IAudioClient` for the chosen render device
+/// (or the eConsole default when `device_id` is `None`/`"default"`), initialized to the fixed
+/// 48k/stereo/f32 format via `initialize_loopback_client`.
+///
+/// Unlike the process path (the `ActivateAudioInterfaceAsync` magic device), endpoint loopback
+/// acquires the client DIRECTLY from a real `IMMDevice` (`Activate::<IAudioClient>`), then
+/// loopback-captures everything rendered to that endpoint. The format is NOT queried via
+/// `GetMixFormat` (the deliberate divergence from OBS) — the engine converts to our hardcoded
+/// format via `AUTOCONVERTPCM`, or activation fails and we return `Unsupported`.
+///
+/// Returns `Activated(client)` on success, or `Unsupported` for ANY failure (missing device,
+/// COM error, unsupported format) — never panics, never throws. This is a SINGLE-source mode: it
+/// runs under the one shared `SESSION` and must NOT co-run with a process capture in the session.
+unsafe fn activate_render_endpoint_loopback(device_id: Option<&str>) -> ActivationResult {
+    let enumerator: IMMDeviceEnumerator =
+        match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+            Ok(e) => e,
+            Err(_) => return ActivationResult::Unsupported,
+        };
+
+    // Resolve the target IMMDevice: the "default" sentinel (or None) -> the eConsole default
+    // render endpoint; any other id -> GetDevice(widened UTF-16 id).
+    let device: IMMDevice = match device_id {
+        None | Some("default") => match enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
+            Ok(d) => d,
+            Err(_) => return ActivationResult::Unsupported,
+        },
+        Some(id) => {
+            // Widen to a NUL-terminated UTF-16 buffer; `wide` outlives the GetDevice call.
+            let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+            match enumerator.GetDevice(PCWSTR(wide.as_ptr())) {
+                Ok(d) => d,
+                Err(_) => return ActivationResult::Unsupported,
+            }
+        }
+    };
+
+    // Acquire the IAudioClient directly from the IMMDevice (no magic device, no async activation).
+    // Any non-success -> Unsupported (mirror the process path's non-S_OK discipline).
+    let audio_client: IAudioClient = match device.Activate(CLSCTX_ALL, None) {
+        Ok(c) => c,
+        Err(_) => return ActivationResult::Unsupported,
+    };
+
+    if initialize_loopback_client(&audio_client).is_err() {
         return ActivationResult::Unsupported;
     }
 
@@ -526,6 +622,177 @@ pub fn start(exclude_root_pid: u32, on_chunk: ChunkTsfn) -> napi::Result<bool> {
     Ok(true)
 }
 
+/// Begin single-app INCLUDE loopback capture of the process tree rooted at `target_pid`
+/// (Discord-style app-exclusive share — captures ONLY that app + its children, self-free
+/// and VAC-free by construction). Emits the SAME fixed 48k/stereo/f32 480-frame (3840-byte)
+/// chunk contract as `start`; the ONLY divergence from the EXCLUDE path is the loopback mode
+/// constant handed to `activate_process_tree`.
+///
+/// Returns `false` (NOT an error) when process-loopback is unavailable on this build OR
+/// activation fails for any reason. App mode fails CLOSED on the TS side (no Chromium
+/// "loopback" fallback — privacy inversion + CoreMessaging crash), so a `false` here leaves
+/// the caller's audio unset.
+///
+/// The single global `SESSION` mutex is shared with `start`/`stop`: only one capture client
+/// runs at a time (multi-app N-INCLUDE + mixer is deferred to the R4 concurrency spike).
+#[napi(js_name = "startIncludeProcessTree")]
+pub fn start_include_process_tree(target_pid: u32, on_chunk: ChunkTsfn) -> napi::Result<bool> {
+    let mut guard = SESSION.lock().unwrap_or_else(|p| p.into_inner());
+    // Idempotent: a session already running counts as "started".
+    if guard.is_some() {
+        return Ok(true);
+    }
+
+    // Manual-reset stop event the capture loop polls; unsignaled initially.
+    let stop_event = match unsafe { CreateEventW(None, true, false, PCWSTR::null()) } {
+        Ok(h) => h,
+        Err(_) => return Ok(false),
+    };
+
+    // Activation is COM-apartment-affine, so run it ON the capture thread and report the
+    // outcome back over a channel; this call returns the real support verdict.
+    let (tx, rx): (Sender<bool>, _) = channel();
+    let stop_event_for_thread = SendHandle(stop_event);
+
+    let join = std::thread::spawn(move || {
+        // Capture the whole SendHandle (Send), not its inner HANDLE field.
+        let stop_handle = stop_event_for_thread;
+
+        // COM on the capture thread (MTA — no message pump needed for WASAPI capture).
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let com_ok = com.is_ok();
+
+        // The ONLY functional divergence from `start`: INCLUDE the target tree.
+        let activation = unsafe {
+            activate_process_tree(PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, target_pid)
+        };
+        match activation {
+            ActivationResult::Activated(client) => {
+                let _ = tx.send(true);
+                unsafe { run_capture_loop(client, on_chunk, stop_handle.0) };
+            }
+            ActivationResult::Unsupported => {
+                let _ = tx.send(false);
+            }
+        }
+
+        if com_ok {
+            unsafe { CoUninitialize() };
+        }
+    });
+
+    // Wait for the activation verdict from the capture thread.
+    let supported = rx.recv().unwrap_or(false);
+    if !supported {
+        // Unsupported: tear the (now-exiting) thread down and clean up the stop event.
+        unsafe {
+            let _ = SetEvent(stop_event);
+        }
+        let _ = join.join();
+        unsafe {
+            let _ = CloseHandle(stop_event);
+        }
+        return Ok(false);
+    }
+
+    *guard = Some(CaptureSession {
+        stop_event,
+        join: Some(join),
+    });
+    Ok(true)
+}
+
+/// Begin render-endpoint loopback capture of `device_id` (or the eConsole default when `None`).
+/// Shared body for the two endpoint napi exports below — identical to the `start` skeleton
+/// (single `SESSION` idempotency, stop event, on-capture-thread MTA activation + channel verdict,
+/// `run_capture_loop` reuse, `Ok(false)` fail-closed), but acquires the client via
+/// `activate_render_endpoint_loopback` instead of the process-tree magic device. Single-source: it
+/// shares the one `SESSION` mutex, so it never co-runs with a process capture in the same session.
+fn start_endpoint_session(device_id: Option<String>, on_chunk: ChunkTsfn) -> napi::Result<bool> {
+    let mut guard = SESSION.lock().unwrap_or_else(|p| p.into_inner());
+    // Idempotent: a session already running counts as "started".
+    if guard.is_some() {
+        return Ok(true);
+    }
+
+    // Manual-reset stop event the capture loop polls; unsignaled initially.
+    let stop_event = match unsafe { CreateEventW(None, true, false, PCWSTR::null()) } {
+        Ok(h) => h,
+        Err(_) => return Ok(false),
+    };
+
+    // Activation is COM-apartment-affine, so run it ON the capture thread and report the
+    // outcome back over a channel; this call returns the real support verdict.
+    let (tx, rx): (Sender<bool>, _) = channel();
+    let stop_event_for_thread = SendHandle(stop_event);
+
+    let join = std::thread::spawn(move || {
+        // Capture the whole SendHandle (Send), not its inner HANDLE field.
+        let stop_handle = stop_event_for_thread;
+
+        // COM on the capture thread (MTA — no message pump needed for WASAPI capture).
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let com_ok = com.is_ok();
+
+        // The ONLY divergence from the process path: acquire the client from a render endpoint.
+        let activation = unsafe { activate_render_endpoint_loopback(device_id.as_deref()) };
+        match activation {
+            ActivationResult::Activated(client) => {
+                let _ = tx.send(true);
+                unsafe { run_capture_loop(client, on_chunk, stop_handle.0) };
+            }
+            ActivationResult::Unsupported => {
+                let _ = tx.send(false);
+            }
+        }
+
+        if com_ok {
+            unsafe { CoUninitialize() };
+        }
+    });
+
+    // Wait for the activation verdict from the capture thread.
+    let supported = rx.recv().unwrap_or(false);
+    if !supported {
+        // Unsupported: tear the (now-exiting) thread down and clean up the stop event.
+        unsafe {
+            let _ = SetEvent(stop_event);
+        }
+        let _ = join.join();
+        unsafe {
+            let _ = CloseHandle(stop_event);
+        }
+        return Ok(false);
+    }
+
+    *guard = Some(CaptureSession {
+        stop_event,
+        join: Some(join),
+    });
+    Ok(true)
+}
+
+/// Begin endpoint loopback capture of an explicitly-chosen render endpoint (`device_id` is a raw
+/// `IMMDevice` id from the render-endpoint list, or the `"default"` sentinel). The VAC/Sonar fix:
+/// point GoofCord at a clean render bus. Emits the SAME fixed 48k/stereo/f32 480-frame (3840-byte)
+/// chunk contract as every other native path. Returns `false` (NOT an error) when activation fails
+/// — explicit-endpoint mode fails CLOSED on the TS side (no Chromium `"loopback"` fallback), so a
+/// `false` here leaves the caller's audio unset.
+#[napi(js_name = "startRenderEndpoint")]
+pub fn start_render_endpoint(device_id: String, on_chunk: ChunkTsfn) -> napi::Result<bool> {
+    start_endpoint_session(Some(device_id), on_chunk)
+}
+
+/// Begin endpoint loopback capture of the eConsole DEFAULT render endpoint (resolved once at share
+/// start via `GetDefaultAudioEndpoint(eRender, eConsole)`; default-device-change follow is
+/// deferred). Emits the SAME fixed 48k/stereo/f32 480-frame (3840-byte) chunk contract. Returns
+/// `false` (NOT an error) when activation fails — the caller decides fallback (strict modes fail
+/// closed to no audio).
+#[napi(js_name = "startDefaultRenderEndpoint")]
+pub fn start_default_render_endpoint(on_chunk: ChunkTsfn) -> napi::Result<bool> {
+    start_endpoint_session(None, on_chunk)
+}
+
 /// Stop capture: signal the capture thread to exit, then join it with a bounded timeout
 /// so a hung native teardown can't wedge the caller (composes with the JS wrapper's
 /// before-quit Promise.race). Idempotent — a no-op if nothing is running.
@@ -565,5 +832,316 @@ pub fn stop() {
 
     unsafe {
         let _ = CloseHandle(session.stop_event);
+    }
+}
+
+// ─── Audio-session app enumeration (listAudioApps) ──────────────────────────────────
+//
+// Clean-room from the public Microsoft Core Audio session APIs (IMMDeviceEnumerator +
+// IAudioSessionManager2/IAudioSessionControl2): enumerate every ACTIVE eRender endpoint,
+// walk each endpoint's audio sessions, and surface one entry per audio-emitting app PID.
+// The picker (Plan 02) lists these so the user can choose an app to INCLUDE-capture.
+// Enumeration is fail-closed: ANY failure at ANY step yields an empty list — never an
+// error, never a panic across the FFI boundary.
+
+/// One audio-emitting app, as surfaced to the screenshare picker. napi maps the fields to
+/// the JS shape `{ processId, displayName, binary }` — the exact contract the existing
+/// renderer checklist already consumes. Do NOT widen it.
+#[napi(object)]
+pub struct AudioAppInfo {
+    /// The app's process id (the INCLUDE-capture target).
+    pub process_id: u32,
+    /// Friendly name: the audio-session display name, else the executable basename.
+    pub display_name: String,
+    /// The executable basename (e.g. `chrome.exe`).
+    pub binary: String,
+}
+
+/// Enumerate audio-emitting apps (one entry per PID). Deduped by PID; the system-sounds
+/// pseudo-session and GoofCord's OWN process id are dropped. Fail-closed: returns an empty
+/// vec on any failure — never throws.
+///
+/// The Electron "Audio Service" utility CHILD pid is dropped on the TS side in Plan 02
+/// (only the main process can resolve it via `app.getAppMetrics()`); this addon drops only
+/// its own process id here — the split is intentional.
+#[napi(js_name = "listAudioApps")]
+pub fn list_audio_apps() -> napi::Result<Vec<AudioAppInfo>> {
+    // Session enumeration is COM-apartment-affine: run it on a dedicated MTA thread (the
+    // same apartment discipline as the capture thread) so it never depends on — or
+    // disturbs — the caller's apartment. A panic on that thread collapses to an empty vec.
+    let apps = std::thread::spawn(|| unsafe { enumerate_audio_apps() })
+        .join()
+        .unwrap_or_default();
+    Ok(apps)
+}
+
+/// MTA-apartment bracket around the enumeration: CoInitialize the dedicated thread, collect,
+/// CoUninitialize — mirrors the capture thread's `CoInitializeEx(COINIT_MULTITHREADED)` +
+/// `CoUninitialize` pattern. All COM interfaces are created and dropped inside
+/// `collect_audio_apps` before the apartment is torn down.
+unsafe fn enumerate_audio_apps() -> Vec<AudioAppInfo> {
+    let com = CoInitializeEx(None, COINIT_MULTITHREADED);
+    let com_ok = com.is_ok();
+    let apps = collect_audio_apps();
+    if com_ok {
+        CoUninitialize();
+    }
+    apps
+}
+
+/// The enumeration body. Every fallible COM step degrades to "skip this item" or an early
+/// empty return — no `?`, no panic, no throw (fail-closed enumeration).
+unsafe fn collect_audio_apps() -> Vec<AudioAppInfo> {
+    let mut out: Vec<AudioAppInfo> = Vec::new();
+    let mut seen: Vec<u32> = Vec::new(); // dedupe by PID (N is tiny; a linear scan is fine).
+    let own_pid = GetCurrentProcessId();
+
+    let enumerator: IMMDeviceEnumerator =
+        match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+            Ok(e) => e,
+            Err(_) => return out,
+        };
+
+    // Every ACTIVE render endpoint — an app can be emitting on any of them.
+    let devices: IMMDeviceCollection =
+        match enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
+            Ok(d) => d,
+            Err(_) => return out,
+        };
+
+    let device_count = devices.GetCount().unwrap_or(0);
+    for d in 0..device_count {
+        let device: IMMDevice = match devices.Item(d) {
+            Ok(dev) => dev,
+            Err(_) => continue,
+        };
+        let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let sessions: IAudioSessionEnumerator = match manager.GetSessionEnumerator() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let session_count = sessions.GetCount().unwrap_or(0);
+        for s in 0..session_count {
+            let control: IAudioSessionControl = match sessions.GetSession(s) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let control2: IAudioSessionControl2 = match control.cast() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Drop the system-sounds pseudo-session (S_OK == "is system sounds").
+            if control2.IsSystemSoundsSession() == S_OK {
+                continue;
+            }
+
+            let pid = match control2.GetProcessId() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            // Drop the "no single process" sentinel (0), GoofCord's own PID, and dupes.
+            if pid == 0 || pid == own_pid || seen.contains(&pid) {
+                continue;
+            }
+            seen.push(pid);
+
+            // Prefer the session display name; fall back to the executable basename.
+            let binary = process_basename(pid);
+            let display_name =
+                session_display_name(&control).unwrap_or_else(|| binary.clone());
+            out.push(AudioAppInfo {
+                process_id: pid,
+                display_name,
+                binary,
+            });
+        }
+    }
+
+    out
+}
+
+/// The session's friendly display name, or `None` when absent. An empty name — or an
+/// unexpanded resource reference (`@%SystemRoot%\...,-101`) that would render as gibberish —
+/// is treated as "no name" so the caller falls back to the executable basename. The string
+/// GetDisplayName hands back is CoTaskMem-allocated; we free it here regardless of parse.
+unsafe fn session_display_name(control: &IAudioSessionControl) -> Option<String> {
+    let raw: PWSTR = control.GetDisplayName().ok()?;
+    if raw.is_null() {
+        return None;
+    }
+    let owned = raw.to_string().ok();
+    CoTaskMemFree(Some(raw.as_ptr() as *const core::ffi::c_void));
+
+    let name = owned?;
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.starts_with('@') {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// The executable basename for `pid` (e.g. `chrome.exe`) via `QueryFullProcessImageNameW`,
+/// or an empty string when the process can't be opened/queried. Opens with only
+/// PROCESS_QUERY_LIMITED_INFORMATION (resolves across integrity levels without elevation).
+unsafe fn process_basename(pid: u32) -> String {
+    let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+        Ok(h) => h,
+        Err(_) => return String::new(),
+    };
+
+    let mut buf = [0u16; 260]; // MAX_PATH
+    let mut size = buf.len() as u32;
+    let queried = QueryFullProcessImageNameW(
+        handle,
+        PROCESS_NAME_WIN32,
+        PWSTR::from_raw(buf.as_mut_ptr()),
+        &mut size,
+    )
+    .is_ok();
+    let _ = CloseHandle(handle);
+
+    if !queried || size == 0 {
+        return String::new();
+    }
+
+    let full = String::from_utf16_lossy(&buf[..size as usize]);
+    // basename: keep only the segment after the last path separator.
+    full.rsplit(|c| c == '\\' || c == '/')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+// ─── Render-endpoint enumeration (list_render_endpoints) ────────────────────────────
+//
+// Clean-room from the public Microsoft Core Audio device APIs (IMMDeviceEnumerator +
+// IPropertyStore + PKEY_Device_FriendlyName), mirroring OBS's win-wasapi endpoint
+// enumeration: list every ACTIVE eRender endpoint, read its device id + friendly name,
+// and tag the eConsole default. The selector (Plan 04) presents these so the user can
+// point GoofCord at a clean render bus (e.g. a VAC "Stream" endpoint). Fail-closed: ANY
+// failure at ANY step yields an empty list — never an error, never a panic across FFI.
+
+/// One active render endpoint, as surfaced to the source selector. napi maps the fields to
+/// the JS shape `{ id, name, isDefault }` (`is_default` → `isDefault`). `id` is the raw
+/// `IMMDevice` id (the `GetDevice` key); `name` is the friendly name (or the id when the
+/// property store has none); `isDefault` marks the eConsole default render endpoint.
+#[napi(object)]
+pub struct RenderEndpointInfo {
+    /// The endpoint's `IMMDevice` id (the explicit render-endpoint selector key).
+    pub id: String,
+    /// Friendly name (`PKEY_Device_FriendlyName`), falling back to the id.
+    pub name: String,
+    /// True for the current eConsole default render endpoint (the `"default"` sentinel target).
+    pub is_default: bool,
+}
+
+/// Enumerate active render endpoints (one entry per `eRender` `DEVICE_STATE_ACTIVE` device),
+/// with the eConsole default tagged. Fail-closed: returns an empty vec on any failure — never
+/// throws. Runs on a dedicated MTA thread (same apartment discipline as `listAudioApps` and the
+/// capture thread) so it never depends on — or disturbs — the caller's apartment.
+#[napi(js_name = "listRenderEndpoints")]
+pub fn list_render_endpoints() -> napi::Result<Vec<RenderEndpointInfo>> {
+    let endpoints = std::thread::spawn(|| unsafe { enumerate_render_endpoints() })
+        .join()
+        .unwrap_or_default();
+    Ok(endpoints)
+}
+
+/// MTA-apartment bracket around the render-endpoint enumeration (mirrors `enumerate_audio_apps`):
+/// CoInitialize the dedicated thread, collect, CoUninitialize. All COM interfaces are created and
+/// dropped inside `collect_render_endpoints` before the apartment is torn down.
+unsafe fn enumerate_render_endpoints() -> Vec<RenderEndpointInfo> {
+    let com = CoInitializeEx(None, COINIT_MULTITHREADED);
+    let com_ok = com.is_ok();
+    let out = collect_render_endpoints();
+    if com_ok {
+        CoUninitialize();
+    }
+    out
+}
+
+/// The enumeration body. Every fallible COM step degrades to "skip this endpoint" or an early
+/// empty return — no `?`, no panic, no throw (fail-closed enumeration).
+unsafe fn collect_render_endpoints() -> Vec<RenderEndpointInfo> {
+    let mut out: Vec<RenderEndpointInfo> = Vec::new();
+
+    let enumerator: IMMDeviceEnumerator =
+        match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+            Ok(e) => e,
+            Err(_) => return out,
+        };
+
+    // Resolve the eConsole default once (best-effort) so each entry can be tagged. A failure
+    // here just means nothing is tagged default — enumeration still proceeds.
+    let default_id: Option<String> = match enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
+        Ok(d) => immdevice_id(&d),
+        Err(_) => None,
+    };
+
+    let devices: IMMDeviceCollection =
+        match enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
+            Ok(d) => d,
+            Err(_) => return out,
+        };
+
+    let device_count = devices.GetCount().unwrap_or(0);
+    for d in 0..device_count {
+        let device: IMMDevice = match devices.Item(d) {
+            Ok(dev) => dev,
+            Err(_) => continue,
+        };
+        // The id is the selector key — an endpoint without one is unusable, so skip it.
+        let id = match immdevice_id(&device) {
+            Some(i) => i,
+            None => continue,
+        };
+        let name = endpoint_friendly_name(&device).unwrap_or_else(|| id.clone());
+        let is_default = default_id.as_deref() == Some(id.as_str());
+        out.push(RenderEndpointInfo { id, name, is_default });
+    }
+
+    out
+}
+
+/// The `IMMDevice` id string (the `GetDevice`/selector key), or `None` when absent. `GetId`
+/// hands back a CoTaskMem-allocated `PWSTR`; we copy it into an owned `String` and free the
+/// original with `CoTaskMemFree` (same ownership discipline as `session_display_name`).
+unsafe fn immdevice_id(device: &IMMDevice) -> Option<String> {
+    let raw: PWSTR = device.GetId().ok()?;
+    if raw.is_null() {
+        return None;
+    }
+    let owned = raw.to_string().ok();
+    CoTaskMemFree(Some(raw.as_ptr() as *const core::ffi::c_void));
+    owned
+}
+
+/// The endpoint's friendly name via the property store (`PKEY_Device_FriendlyName`), or `None`.
+/// The string lives inside the returned owning `PROPVARIANT` (`VT_LPWSTR`); we copy it into an
+/// owned `String` and let the `PROPVARIANT` drop — its `PropVariantClear` frees the string (we
+/// OWN the value returned by `GetValue`, so this is the correct release, NOT `CoTaskMemFree`).
+unsafe fn endpoint_friendly_name(device: &IMMDevice) -> Option<String> {
+    let store: IPropertyStore = device.OpenPropertyStore(STGM_READ).ok()?;
+    let prop = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
+    let pv = &prop.Anonymous.Anonymous;
+    if pv.vt != VT_LPWSTR {
+        return None;
+    }
+    let raw = pv.Anonymous.pwszVal;
+    if raw.is_null() {
+        return None;
+    }
+    let owned = raw.to_string().ok()?;
+    let trimmed = owned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
