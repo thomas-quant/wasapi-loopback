@@ -32,6 +32,8 @@ windows-core = "0.62"
 #   Win32_Media_Multimedia             -> KSDATAFORMAT_SUBTYPE_IEEE_FLOAT (the WAVEFORMATEXTENSIBLE SubFormat)
 #   Win32_System_Variant               -> VT_BLOB / VARENUM (the PROPVARIANT discriminant)
 #   Win32_System_Com_StructuredStorage -> PROPVARIANT (carries AUDIOCLIENT_ACTIVATION_PARAMS into the activation)
+#   Win32_UI_Shell_PropertiesSystem    -> IPropertyStore / STGM_READ (read a render endpoint's friendly name)
+#   Win32_Devices_FunctionDiscovery    -> PKEY_Device_FriendlyName (the friendly-name property key)
 [dependencies.windows]
 version = "0.62"
 features = [
@@ -45,6 +47,8 @@ features = [
     "Win32_Media_Multimedia",
     "Win32_System_Variant",
     "Win32_System_Com_StructuredStorage",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Devices_FunctionDiscovery",
 ]
 
 [build-dependencies]
