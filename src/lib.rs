@@ -420,6 +420,64 @@ unsafe fn activate_render_endpoint_loopback(device_id: Option<&str>) -> Activati
     ActivationResult::Activated(audio_client)
 }
 
+/// Attempt endpoint-bound process-tree EXCLUDE loopback for the semantic spike. The chosen
+/// `IMMDevice` supplies the endpoint scope while the synchronous activation blob asks the audio
+/// engine to exclude `exclude_root_pid` and its children. Unlike the shipped endpoint helper,
+/// failures retain both their stage and raw HRESULT for the on-box diagnostic log.
+unsafe fn activate_render_endpoint_exclude_tree(
+    device_id: Option<&str>,
+    exclude_root_pid: u32,
+) -> Result<IAudioClient, (&'static str, HRESULT)> {
+    let enumerator: IMMDeviceEnumerator =
+        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .map_err(|err| ("resolve", err.code()))?;
+
+    let device: IMMDevice = match device_id {
+        None | Some("default") => enumerator
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+            .map_err(|err| ("resolve", err.code()))?,
+        Some(id) => {
+            let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+            enumerator
+                .GetDevice(PCWSTR(wide.as_ptr()))
+                .map_err(|err| ("resolve", err.code()))?
+        }
+    };
+
+    let mut activation_params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                TargetProcessId: exclude_root_pid,
+                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            },
+        },
+    };
+
+    // PROPVARIANT owns and clears VT_BLOB data by default, but this blob borrows the stack
+    // `activation_params`. ManuallyDrop is load-bearing: PropVariantClear would otherwise call
+    // CoTaskMemFree on this stack pointer and corrupt the heap. IMMDevice::Activate is synchronous,
+    // so the borrowed blob remains alive for the complete call and owns no memory to release.
+    let mut prop = ManuallyDrop::new(PROPVARIANT::default());
+    {
+        let pv = &mut prop.Anonymous.Anonymous;
+        pv.vt = VT_BLOB;
+        pv.Anonymous.blob = BLOB {
+            cbSize: size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+            pBlobData: &mut activation_params as *mut _ as *mut u8,
+        };
+    }
+
+    let audio_client: IAudioClient = device
+        .Activate(CLSCTX_ALL, Some(&*prop as *const PROPVARIANT))
+        .map_err(|err| ("activate", err.code()))?;
+
+    initialize_loopback_client(&audio_client)
+        .map_err(|err| ("initialize", err.code()))?;
+
+    Ok(audio_client)
+}
+
 // ─── Capture-thread state ───────────────────────────────────────────────────────────
 //
 // A single capture session at a time. The capture thread owns the COM-apartment-affine
@@ -772,6 +830,76 @@ fn start_endpoint_session(device_id: Option<String>, on_chunk: ChunkTsfn) -> nap
     Ok(true)
 }
 
+/// Spike-only endpoint-bound EXCLUDE-tree session. This intentionally duplicates the proven
+/// endpoint session skeleton so none of the shipped capture paths change before the on-box
+/// semantic test. `0` means capture entered `run_capture_loop`; failure returns the raw HRESULT.
+fn start_endpoint_exclude_tree_session(
+    device_id: Option<String>,
+    exclude_root_pid: u32,
+    on_chunk: ChunkTsfn,
+) -> napi::Result<i32> {
+    let mut guard = SESSION.lock().unwrap_or_else(|p| p.into_inner());
+    // Idempotent: a session already running counts as "started".
+    if guard.is_some() {
+        return Ok(S_OK.0);
+    }
+
+    // Manual-reset stop event the capture loop polls; unsignaled initially.
+    let stop_event = match unsafe { CreateEventW(None, true, false, PCWSTR::null()) } {
+        Ok(h) => h,
+        Err(err) => return Ok(err.code().0),
+    };
+
+    // Preserve the failing activation stage together with its raw HRESULT across the thread
+    // boundary. The napi surface returns the HRESULT; the stage names keep this channel decisive
+    // and ready for the integration pass without collapsing failures to Unsupported.
+    let (tx, rx): (Sender<Result<(), (&'static str, HRESULT)>>, _) = channel();
+    let stop_event_for_thread = SendHandle(stop_event);
+
+    let join = std::thread::spawn(move || {
+        let stop_handle = stop_event_for_thread;
+
+        // COM on the capture thread (MTA — no message pump needed for WASAPI capture).
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let com_ok = com.is_ok();
+
+        let activation = unsafe {
+            activate_render_endpoint_exclude_tree(device_id.as_deref(), exclude_root_pid)
+        };
+        match activation {
+            Ok(client) => {
+                let _ = tx.send(Ok(()));
+                unsafe { run_capture_loop(client, on_chunk, stop_handle.0) };
+            }
+            Err(failure) => {
+                let _ = tx.send(Err(failure));
+            }
+        }
+
+        if com_ok {
+            unsafe { CoUninitialize() };
+        }
+    });
+
+    let activation = rx.recv().unwrap_or(Err(("activation_channel", E_FAIL)));
+    if let Err((_stage, hr)) = activation {
+        unsafe {
+            let _ = SetEvent(stop_event);
+        }
+        let _ = join.join();
+        unsafe {
+            let _ = CloseHandle(stop_event);
+        }
+        return Ok(hr.0);
+    }
+
+    *guard = Some(CaptureSession {
+        stop_event,
+        join: Some(join),
+    });
+    Ok(S_OK.0)
+}
+
 /// Begin endpoint loopback capture of an explicitly-chosen render endpoint (`device_id` is a raw
 /// `IMMDevice` id from the render-endpoint list, or the `"default"` sentinel). The VAC/Sonar fix:
 /// point GoofCord at a clean render bus. Emits the SAME fixed 48k/stereo/f32 480-frame (3840-byte)
@@ -791,6 +919,27 @@ pub fn start_render_endpoint(device_id: String, on_chunk: ChunkTsfn) -> napi::Re
 #[napi(js_name = "startDefaultRenderEndpoint")]
 pub fn start_default_render_endpoint(on_chunk: ChunkTsfn) -> napi::Result<bool> {
     start_endpoint_session(None, on_chunk)
+}
+
+/// Spike: capture one explicit render endpoint while excluding GoofCord's process tree. Returns
+/// `0` when capture starts, otherwise the raw HRESULT from resolve/activate/initialize.
+#[napi(js_name = "startRenderEndpointExcludeProcessTree")]
+pub fn start_render_endpoint_exclude_process_tree(
+    device_id: String,
+    exclude_root_pid: u32,
+    on_chunk: ChunkTsfn,
+) -> napi::Result<i32> {
+    start_endpoint_exclude_tree_session(Some(device_id), exclude_root_pid, on_chunk)
+}
+
+/// Spike: capture the eConsole default render endpoint while excluding GoofCord's process tree.
+/// Returns `0` when capture starts, otherwise the raw HRESULT from resolve/activate/initialize.
+#[napi(js_name = "startDefaultRenderEndpointExcludeProcessTree")]
+pub fn start_default_render_endpoint_exclude_process_tree(
+    exclude_root_pid: u32,
+    on_chunk: ChunkTsfn,
+) -> napi::Result<i32> {
+    start_endpoint_exclude_tree_session(None, exclude_root_pid, on_chunk)
 }
 
 /// Stop capture: signal the capture thread to exit, then join it with a bounded timeout
