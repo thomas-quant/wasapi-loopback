@@ -1,12 +1,9 @@
-# Rust build artifacts (the release .node is produced on the windows-latest CI runner).
+# Rust build artifacts (the prebuilt .node is produced on the windows-latest CI runner
+# and consumed by GoofCord via GOOFCORD_WASAPI_LOOPBACK_PATH — never committed here).
 /target/
 
-# napi-rs build outputs. The committed prebuilt under prebuilds/ is the ONE exception:
-# it is this package's distribution unit (consumed by GoofCord's copyNativeModules() via
-# the optionalDependency github ref), so it is tracked via the negation below. The CI
-# commit-back step also force-adds it (`git add -f`) as a belt-and-suspenders backstop.
+# napi-rs build outputs
 *.node
-!prebuilds/**/*.node
 index.js
 index.d.ts
 
