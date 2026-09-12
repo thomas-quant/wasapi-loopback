@@ -18,6 +18,9 @@ napi-derive = "3.5.6"
 # a direct dependency (the `windows` crate re-exports it as `windows::core`, but the macro
 # needs the crate name `windows_core` resolvable at the crate root).
 windows-core = "0.62"
+# Portable timeline/alignment/subtraction core of startEndpointMinusSelf. No dependencies and no
+# Windows code, so its tests run anywhere: `cargo test --manifest-path subtract-core/Cargo.toml`.
+wasapi-subtract-core = { path = "subtract-core" }
 
 # Win32 bindings for the public WASAPI Application Loopback API surface.
 # Feature-gated to keep build size/time down — these modules provide:
@@ -48,6 +51,8 @@ windows-core = "0.62"
 # (IPropertyStore) and Win32_Devices_FunctionDiscovery (PKEY_Device_FriendlyName). eConsole/
 # GetDefaultAudioEndpoint/GetDevice/OpenPropertyStore stay under the existing Win32_Media_Audio;
 # STGM_READ under Win32_System_Com; VT_LPWSTR under Win32_System_Variant (all already enabled).
+# startEndpointMinusSelf adds Win32_System_Diagnostics_ToolHelp (process-tree snapshot for the
+# off-endpoint route guard) and Win32_System_Performance (QueryPerformanceCounter read times).
 [dependencies.windows]
 version = "0.62"
 features = [
@@ -63,6 +68,8 @@ features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Devices_FunctionDiscovery",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Performance",
 ]
 
 [build-dependencies]

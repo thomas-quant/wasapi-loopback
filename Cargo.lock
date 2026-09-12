@@ -268,9 +268,14 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "wasapi-subtract-core",
  "windows",
  "windows-core",
 ]
+
+[[package]]
+name = "wasapi-subtract-core"
+version = "0.1.0"
 
 [[package]]
 name = "windows"

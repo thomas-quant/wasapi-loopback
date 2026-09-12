@@ -13,6 +13,8 @@
   "files": [
     "prebuilds",
     "src",
+    "subtract-core",
+    "SUBTRACTION.md",
     "Cargo.toml",
     "Cargo.lock",
     "build.rs",

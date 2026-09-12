@@ -24,6 +24,9 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Test subtraction core
+        run: cargo test --manifest-path subtract-core/Cargo.toml
+
       - name: Check native code
         run: cargo clippy --target x86_64-pc-windows-msvc
 
@@ -47,7 +50,7 @@ jobs:
       - name: Verify addon API
         shell: pwsh
         run: |
-          node -e "const a = require('./prebuilds/windows-x86_64/wasapi-loopback-win32-x64.node'); for (const k of ['startExcludeProcessTree', 'startIncludeProcessTree', 'stopSession', 'stopAll', 'listAudioApps', 'getCaptureStats', 'listRenderEndpoints', 'startRenderEndpointLoopback']) { if (typeof a[k] !== 'function') throw Error('Missing WASAPI export: ' + k); } a.stopAll(); console.log(Object.keys(a));"
+          node -e "const a = require('./prebuilds/windows-x86_64/wasapi-loopback-win32-x64.node'); for (const k of ['startExcludeProcessTree', 'startIncludeProcessTree', 'startEndpointMinusSelf', 'getSubtractionStatus', 'getLastSubtractionStartError', 'stopSession', 'stopAll', 'listAudioApps', 'getCaptureStats', 'listRenderEndpoints', 'startRenderEndpointLoopback']) { if (typeof a[k] !== 'function') throw Error('Missing WASAPI export: ' + k); } a.stopAll(); console.log(Object.keys(a));"
 
       - name: Upload prebuilt
         uses: actions/upload-artifact@v4

@@ -76,6 +76,10 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
 
+// Endpoint-minus-own-process subtraction (`startEndpointMinusSelf`): a paired-leg owner built on
+// the portable `wasapi-subtract-core` crate. Shares the session registry below.
+mod paired;
+
 // ─── Hardcoded capture format (the renderer/transport contract) ─────────────────────
 //
 // 48000 Hz / 2 channels / 32-bit IEEE float, interleaved stereo (L,R,L,R...).
@@ -400,6 +404,8 @@ struct CaptureSession {
     join: Option<JoinHandle<()>>,
     /// Live timing counters, shared with the capture thread.
     stats: Arc<StreamStats>,
+    /// Subtraction state, for `startEndpointMinusSelf` sessions only.
+    subtraction: Option<Arc<paired::PairShared>>,
 }
 
 // HANDLE is a raw pointer; it is only ever touched under the GLOBAL mutex below and on
@@ -750,6 +756,7 @@ where
         stop_event,
         join: Some(join),
         stats,
+        subtraction: None,
     };
 
     if !started {
