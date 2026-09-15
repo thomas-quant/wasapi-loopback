@@ -57,7 +57,16 @@ function listAudioApps(): { processId: number; displayName: string; binary: stri
 // chunks delivered); pair timingFrame with qpcPosition100Ns for rate. DevicePosition may never
 // advance on process loopback (devicePositionAdvances === 0) — don't rely on it.
 function getCaptureStats(id: number): CaptureStats | null;
+// Endpoint loopback of one render device MINUS process-loopback INCLUDE of rootPid's tree, at a
+// verified integer offset and unity gain; muted while unverified, never an EXCLUDE/raw fallback.
+// deviceId null/undefined/"default" = eConsole default. See SUBTRACTION.md.
+function startEndpointMinusSelf(rootPid: number, deviceId: string | undefined | null, onChunk: OnChunk): number;
+function getSubtractionStatus(id: number): SubtractionStatus | null; // state aligning|running|failed, reason, offsetFrames, bufferedFrames, generation, …
+function getLastSubtractionStartError(): string | null;
 ```
+
+The subtraction's timeline/alignment core is the dependency-free `subtract-core/` crate, testable
+on any OS: `cargo test --manifest-path subtract-core/Cargo.toml`.
 
 ## Building (Windows only)
 

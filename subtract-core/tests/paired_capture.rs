@@ -155,9 +155,13 @@ struct Run {
 }
 
 fn run(sc: &Scenario) -> Run {
-    let mut engine = Engine::new(sc.cfg.clone());
     let mut pk = packets(&sc.rf, Leg::Reference, sc.end, None, &|w, ch| (sc.own)(w, ch));
     pk.extend(packets(&sc.ep, Leg::Endpoint, sc.end, sc.slip_at, &|w, ch| sc.endpoint_sample(w, ch)));
+    run_packets(sc, pk)
+}
+
+fn run_packets(sc: &Scenario, mut pk: Vec<Pkt>) -> Run {
+    let mut engine = Engine::new(sc.cfg.clone());
     pk.sort_by_key(|p| (p.arrival, p.leg == Leg::Endpoint, p.order));
 
     let mut r = Run {
@@ -243,6 +247,87 @@ fn assert_locked_exactly(sc: &Scenario, r: &Run) {
     assert!(r.fault.is_none(), "unexpected fault: {:?}", r.fault);
     assert_eq!(r.status.phase, Phase::Running, "{:#?}", r.status);
     assert_eq!(r.status.offset_frames, Some(expected_offset(sc, r)), "{:#?}", r.status);
+}
+
+/// Model a finite packet queue while the capture reader is blocked. This is a
+/// deterministic core test, not an injected Windows stall or a WASAPI guarantee.
+fn with_reader_stall(
+    mut packets: Vec<Pkt>,
+    start: i64,
+    duration: i64,
+    capacity_frames: usize,
+) -> (Vec<Pkt>, usize) {
+    let end = start + duration;
+    packets.sort_by_key(|p| (p.arrival, p.order));
+    let mut delivered = Vec::new();
+    let mut queued = std::collections::VecDeque::<Pkt>::new();
+    let mut queued_frames = 0usize;
+    let mut dropped_frames = 0usize;
+    for packet in packets {
+        if packet.arrival >= start && packet.arrival < end {
+            queued_frames += packet.walls.len();
+            queued.push_back(packet);
+            while queued_frames > capacity_frames {
+                let dropped = queued.pop_front().unwrap();
+                queued_frames -= dropped.walls.len();
+                dropped_frames += dropped.walls.len();
+            }
+        } else {
+            delivered.push(packet);
+        }
+    }
+    if dropped_frames > 0 {
+        if let Some(first) = queued.front_mut() {
+            first.info.discontinuity = true;
+        }
+    }
+    for mut packet in queued {
+        packet.arrival = end;
+        packet.info.read_qpc_100ns = hns(end);
+        // Preserve the engine timestamp: delayed reads do not retime samples.
+        delivered.push(packet);
+    }
+    (delivered, dropped_frames)
+}
+
+#[test]
+fn finite_queue_survives_a_30ms_reader_stall_only_with_enough_capacity() {
+    let sc = Scenario::new(1024);
+    let make_packets = || {
+        let mut pk = packets(&sc.rf, Leg::Reference, sc.end, None, &|w, ch| {
+            (sc.own)(w, ch)
+        });
+        pk.extend(packets(&sc.ep, Leg::Endpoint, sc.end, sc.slip_at, &|w, ch| {
+            sc.endpoint_sample(w, ch)
+        }));
+        pk
+    };
+    let baseline = run_packets(&sc, make_packets());
+    assert_locked_exactly(&sc, &baseline);
+    assert!(assert_no_leak(&sc, &baseline, None) > 0);
+
+    // Each leg has its own queue. 30 ms produces three 480-frame packets;
+    // 1056 frames cannot retain all three, whereas 9600 frames can.
+    let simulate = |capacity| {
+        let pk = make_packets();
+        let (ep, rf): (Vec<_>, Vec<_>) =
+            pk.into_iter().partition(|p| p.leg == Leg::Endpoint);
+        let (mut ep, ep_drops) = with_reader_stall(ep, 3 * F, 1440, capacity);
+        let (rf, rf_drops) = with_reader_stall(rf, 3 * F, 1440, capacity);
+        ep.extend(rf);
+        (run_packets(&sc, ep), ep_drops, rf_drops)
+    };
+    let (small, ep_drops, rf_drops) = simulate(1056);
+    assert_eq!((ep_drops, rf_drops), (480, 480));
+    assert_locked_exactly(&sc, &small);
+    assert!(assert_no_leak(&sc, &small, None) > 0);
+
+    let (large, ep_drops, rf_drops) = simulate(9600);
+    assert_eq!((ep_drops, rf_drops), (0, 0));
+    assert_locked_exactly(&sc, &large);
+    assert_eq!(large.ep_walls, baseline.ep_walls);
+    assert_eq!(large.out, baseline.out);
+    assert!(assert_no_leak(&sc, &large, None) > 0);
 }
 
 #[test]

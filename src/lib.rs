@@ -260,6 +260,10 @@ fn resolve_activate_fn() -> Option<ActivateAudioInterfaceAsyncFn> {
 /// Initialize parameter — AUTOCONVERTPCM goes HERE, not into hnsPeriodicity (Pitfall 2 / MS
 /// sample bug #196). Returns the raw `Initialize` result; callers collapse `Err` to `Unsupported`.
 unsafe fn initialize_loopback_client(audio_client: &IAudioClient) -> windows::core::Result<()> {
+    initialize_loopback_client_with_duration(audio_client, 0)
+}
+
+unsafe fn initialize_loopback_client_with_duration(audio_client: &IAudioClient, buffer_100ns: i64) -> windows::core::Result<()> {
     let wfx = build_wave_format();
     let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
         | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
@@ -268,7 +272,7 @@ unsafe fn initialize_loopback_client(audio_client: &IAudioClient) -> windows::co
     audio_client.Initialize(
         AUDCLNT_SHAREMODE_SHARED,
         stream_flags,                 // <-- StreamFlags (2nd param): AUTOCONVERTPCM lives here.
-        0,                            // hnsBufferDuration (engine default in event-driven shared mode)
+        buffer_100ns,                 // Capacity, not a delay: readers drain every available packet.
         0,                            // hnsPeriodicity (0 for event-driven shared mode)
         &wfx as *const _ as *const WAVEFORMATEX,
         None,
@@ -288,6 +292,10 @@ unsafe fn initialize_loopback_client(audio_client: &IAudioClient) -> windows::co
 /// Returns `Activated(client)` on success, or `Unsupported` for ANY failure (missing
 /// entry point, non-S_OK activate result, or COM error) — never panics, never throws.
 unsafe fn activate_process_tree(mode: PROCESS_LOOPBACK_MODE, target_pid: u32) -> ActivationResult {
+    activate_process_tree_with_duration(mode, target_pid, 0)
+}
+
+unsafe fn activate_process_tree_with_duration(mode: PROCESS_LOOPBACK_MODE, target_pid: u32, buffer_100ns: i64) -> ActivationResult {
     // 1. Dynamic-load gate: if the entry point is absent, this build doesn't support it.
     let Some(activate) = resolve_activate_fn() else {
         return ActivationResult::Unsupported;
@@ -382,7 +390,7 @@ unsafe fn activate_process_tree(mode: PROCESS_LOOPBACK_MODE, target_pid: u32) ->
     //    Initialize/stream-flags block the endpoint path uses, so the transport format stays
     //    byte-identical across both client-acquisition paths. AUTOCONVERTPCM makes the shared-mode
     //    engine convert to our hardcoded format, so no Rust DSP.
-    if initialize_loopback_client(&audio_client).is_err() {
+    if initialize_loopback_client_with_duration(&audio_client, buffer_100ns).is_err() {
         return ActivationResult::Unsupported;
     }
 

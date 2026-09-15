@@ -37,10 +37,25 @@ const ROUTE_GUARD_INTERVAL: Duration = Duration::from_millis(250);
 /// Upper bound on one wait for either leg's event; also bounds alignment-result pickup latency.
 const PAIR_WAIT_MS: u32 = 20;
 
+// The default process-loopback buffer measured only 480 frames (10 ms), less than
+// a route snapshot (up to 25 ms on hardware). Keep 200 ms capacity on BOTH paired
+// legs to survive that bounded scheduling stall. We still drain on every event;
+// this does not add a 200 ms playout delay or change engine alignment tolerances.
+const PAIR_BUFFER_100NS: i64 = 2_000_000;
+
 /// State shared between a paired session's owner thread and `getSubtractionStatus`.
 pub(crate) struct PairShared {
     status: Mutex<Status>,
     endpoint_id: Mutex<String>,
+    timing: Mutex<PairTiming>,
+}
+
+#[derive(Clone, Default)]
+struct PairTiming {
+    endpoint_buffer_frames: u32,
+    reference_buffer_frames: u32,
+    route_guard_max_ms: f64,
+    route_guard_calls: u32,
 }
 
 impl PairShared {
@@ -48,6 +63,7 @@ impl PairShared {
         PairShared {
             status: Mutex::new(Status::default()),
             endpoint_id: Mutex::new(String::new()),
+            timing: Mutex::new(PairTiming::default()),
         }
     }
 
@@ -90,12 +106,17 @@ pub struct SubtractionStatus {
     pub discontinuities: f64,
     pub timeline_gaps: f64,
     pub dropped_chunks: f64,
+    pub endpoint_buffer_frames: u32,
+    pub reference_buffer_frames: u32,
+    pub route_guard_max_ms: f64,
+    pub route_guard_calls: u32,
 }
 
 impl SubtractionStatus {
     fn from_shared(shared: &PairShared) -> Self {
         let s = shared.status.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let endpoint_id = shared.endpoint_id.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let timing = shared.timing.lock().unwrap_or_else(|p| p.into_inner()).clone();
         SubtractionStatus {
             state: s.phase.as_str().to_string(),
             reason: s.reason,
@@ -120,6 +141,10 @@ impl SubtractionStatus {
             discontinuities: s.discontinuities as f64,
             timeline_gaps: s.timeline_gaps as f64,
             dropped_chunks: s.dropped_chunks as f64,
+            endpoint_buffer_frames: timing.endpoint_buffer_frames,
+            reference_buffer_frames: timing.reference_buffer_frames,
+            route_guard_max_ms: timing.route_guard_max_ms,
+            route_guard_calls: timing.route_guard_calls,
         }
     }
 }
@@ -255,11 +280,11 @@ unsafe fn open_pair(root_pid: u32, device_id: Option<&str>) -> Result<PairSetup,
         .map_err(|e| format!("cannot activate endpoint {endpoint_id}: {e}"))?;
     check_endpoint_format(&client)?;
     route_guard(&enumerator, &endpoint_id, root_pid, follow_default)?;
-    initialize_loopback_client(&client)
+    initialize_loopback_client_with_duration(&client, PAIR_BUFFER_100NS)
         .map_err(|e| format!("endpoint loopback Initialize failed: {e}"))?;
 
     let reference_client =
-        match activate_process_tree(PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, root_pid) {
+        match activate_process_tree_with_duration(PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, root_pid, PAIR_BUFFER_100NS) {
             ActivationResult::Activated(c) => c,
             ActivationResult::Unsupported => {
                 return Err("process-loopback INCLUDE of the own tree is unavailable here".into())
@@ -490,6 +515,11 @@ unsafe fn run_pair(
 ) {
     let PairSetup { enumerator, endpoint, reference, endpoint_id, follow_default } = pair;
     let mut engine = Engine::new(Config::default());
+    {
+        let mut timing = shared.timing.lock().unwrap_or_else(|p| p.into_inner());
+        timing.endpoint_buffer_frames = endpoint.audio_client.GetBufferSize().unwrap_or(0);
+        timing.reference_buffer_frames = reference.audio_client.GetBufferSize().unwrap_or(0);
+    }
 
     let (job_tx, job_rx) = sync_channel::<AlignJob>(1);
     let (result_tx, result_rx) = channel::<AlignResult>();
@@ -567,7 +597,14 @@ unsafe fn run_pair(
 
         if last_guard.elapsed() >= ROUTE_GUARD_INTERVAL {
             last_guard = Instant::now();
-            if let Err(why) = route_guard(&enumerator, &endpoint_id, root_pid, follow_default) {
+            let guard_started = Instant::now();
+            let guard_result = route_guard(&enumerator, &endpoint_id, root_pid, follow_default);
+            {
+                let mut timing = shared.timing.lock().unwrap_or_else(|p| p.into_inner());
+                timing.route_guard_calls += 1;
+                timing.route_guard_max_ms = timing.route_guard_max_ms.max(guard_started.elapsed().as_secs_f64() * 1000.0);
+            }
+            if let Err(why) = guard_result {
                 failure = Some((why, E_FAIL));
                 break;
             }

@@ -1,6 +1,6 @@
 # `startEndpointMinusSelf`: endpoint loopback minus own-process loopback
 
-Status: **implemented, compiles for Windows (`cargo check`), and passes the simulated-packet test suite on Linux. Not yet run on a real Windows box.** The on-box checks it still needs are listed at the end.
+Status: **experimental; Windows builds and hardware captures exist, but broad cancellation/reliability acceptance is not complete.** The latest candidate increases paired capture buffers to 200 ms. A silent finite-queue simulation supports the buffer mechanism, and a recorded Windows pilot matches endpoint-minus-self sample arithmetic; neither establishes controlled Windows stall causality or all-device reliability. The interrupted soak is incomplete, and the existing application ZIP still contains the older addon. See [current evidence and limitations](../../tools/wasapi-echo-test/SILENT-STALL-FINDINGS.md) and the [remaining validation plan](../../tools/wasapi-echo-test/REMAINING-VALIDATION-PLAN.md).
 
 ## What it does
 
