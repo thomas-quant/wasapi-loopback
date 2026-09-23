@@ -16,8 +16,11 @@
 //! 1. packet timing gives a coarse offset (never trusted to be exact);
 //! 2. a bounded correlation search around it nominates an integer offset from natural own audio;
 //! 3. the candidate is checked on *later, disjoint* stereo data at unity gain — per channel, the gain
-//!    ratio must be provably within `gain_tolerance` of 1 and the fractional-delay projection
-//!    within `delay_tolerance` of 0. Only then does the generation lock;
+//!    ratio must be provably within `gain_tolerance` of 1, the fractional-delay projection within
+//!    `delay_tolerance` of 0, and what is left after subtracting (`C − R`) must provably not carry
+//!    the reference at any nearby lag (`residual_lags`, within `residual_tolerance`). Gain and delay
+//!    alone are blind to an endpoint effect (EQ, spatialiser…) that keeps both at 1 and 0 while a
+//!    filtered copy of own audio survives the subtraction. Only then does the generation lock;
 //! 4. while locked every endpoint frame is emitted as `C[i] − R[i + offset]` (unity, no filter, no
 //!    adaptation), and a monitor keeps re-checking gain/delay; a conclusive mismatch is a fault.
 //!
@@ -58,6 +61,10 @@ pub struct Config {
     pub gain_tolerance: f64,
     /// Allowed |fractional delay| (samples).
     pub delay_tolerance: f64,
+    /// Lags `1..=residual_lags` either side at which `C − R` is projected onto the reference.
+    pub residual_lags: usize,
+    /// Allowed |projection of `C − R` onto the reference at a nonzero lag| (fraction of own energy).
+    pub residual_tolerance: f64,
     /// Interval half-width multiplier for accepting a candidate.
     pub verify_z: f64,
     /// Interval half-width multiplier for declaring loss of lock (stricter: runs forever).
@@ -98,6 +105,8 @@ impl Default for Config {
             max_verify_sub_blocks: 200,
             gain_tolerance: 0.03,
             delay_tolerance: 0.05,
+            residual_lags: 16,
+            residual_tolerance: 0.03,
             verify_z: 2.0,
             monitor_z: 4.0,
             monitor_window: 20,
@@ -264,32 +273,52 @@ struct ProvenBias {
 struct StereoEvidence {
     gain: [Evidence; 2],
     delay: [Evidence; 2],
+    /// Per channel, per residual lag in `ChannelFit::residual` order.
+    residual: [Vec<Evidence>; 2],
 }
 
 impl StereoEvidence {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, lags: usize) -> Self {
+        let residual = || (0..2 * lags).map(|_| Evidence::new(cap)).collect::<Vec<_>>();
         StereoEvidence {
             gain: [Evidence::new(cap), Evidence::new(cap)],
             delay: [Evidence::new(cap), Evidence::new(cap)],
+            residual: [residual(), residual()],
         }
     }
 
     fn clear(&mut self) {
-        self.gain.iter_mut().chain(self.delay.iter_mut()).for_each(Evidence::clear);
+        self.gain
+            .iter_mut()
+            .chain(self.delay.iter_mut())
+            .chain(self.residual.iter_mut().flatten())
+            .for_each(Evidence::clear);
     }
 
     fn push(&mut self, fit: &[ChannelFit; 2]) -> bool {
         let mut any = false;
-        for ((f, gain), delay) in fit.iter().zip(&mut self.gain).zip(&mut self.delay) {
+        for (ch, f) in fit.iter().enumerate() {
             if let Some(g) = f.gain {
-                gain.push(g);
+                self.gain[ch].push(g);
                 any = true;
             }
             if let Some(d) = f.delay {
-                delay.push(d);
+                self.delay[ch].push(d);
+            }
+            for (ev, p) in self.residual[ch].iter_mut().zip(&f.residual) {
+                ev.push(*p);
             }
         }
         any
+    }
+
+    /// The residual lag whose mean projection is furthest from zero: `(lag, mean)`.
+    fn worst_residual(&self, lags: usize) -> Option<(i64, f64)> {
+        self.residual
+            .iter()
+            .flat_map(|ch| ch.iter().enumerate())
+            .filter_map(|(n, ev)| Some((residual_lag(n, lags), ev.mean()?)))
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
     }
 
     /// Accept only when every channel with enough evidence accepts both tests; reject if any test
@@ -300,11 +329,15 @@ impl StereoEvidence {
         for ch in 0..2 {
             let g = self.gain[ch].verdict(1.0, cfg.gain_tolerance, z, cfg.min_sub_blocks);
             let d = self.delay[ch].verdict(0.0, cfg.delay_tolerance, z, cfg.min_sub_blocks);
-            if g == Verdict::Reject || d == Verdict::Reject {
+            let residual: Vec<Verdict> = self.residual[ch]
+                .iter()
+                .map(|ev| ev.verdict(0.0, cfg.residual_tolerance, z, cfg.min_sub_blocks))
+                .collect();
+            if g == Verdict::Reject || d == Verdict::Reject || residual.contains(&Verdict::Reject) {
                 return Verdict::Reject;
             }
             if self.gain[ch].len() >= cfg.min_sub_blocks {
-                if g == Verdict::Accept && d == Verdict::Accept {
+                if g == Verdict::Accept && d == Verdict::Accept && residual.iter().all(|v| *v == Verdict::Accept) {
                     decided += 1;
                 } else {
                     pending = true;
@@ -318,10 +351,13 @@ impl StereoEvidence {
         }
     }
 
-    fn describe(&self) -> String {
+    fn describe(&self, lags: usize) -> String {
         let f = |e: &Evidence| e.mean().map_or("n/a".to_string(), |m| format!("{m:.4}"));
+        let worst = self
+            .worst_residual(lags)
+            .map_or("n/a".to_string(), |(lag, m)| format!("{m:+.4} at lag {lag:+}"));
         format!(
-            "gain L {} R {}, delay L {} R {}",
+            "gain L {} R {}, delay L {} R {}, worst residual {worst}",
             f(&self.gain[0]),
             f(&self.gain[1]),
             f(&self.delay[0]),
@@ -330,10 +366,21 @@ impl StereoEvidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ChannelFit {
     gain: Option<f64>,
     delay: Option<f64>,
+    /// `<C − R, R shifted by lag> / <R, R>` for lags `-L..=-1, 1..=L` (see `residual_lag`).
+    residual: Vec<f64>,
+}
+
+/// Lag of residual slot `n` out of `2 · lags`: `-lags..=-1` then `1..=lags`.
+fn residual_lag(n: usize, lags: usize) -> i64 {
+    if n < lags {
+        n as i64 - lags as i64
+    } else {
+        (n - lags) as i64 + 1
+    }
 }
 
 struct Candidate {
@@ -391,7 +438,7 @@ impl Engine {
             last_reject: None,
             out_next: 0,
             monitor_next: 0,
-            monitor: StereoEvidence::new(window),
+            monitor: StereoEvidence::new(window, cfg.residual_lags),
             monitor_fresh: 0,
             monitor_rejects: 0,
             acc: Vec::with_capacity(CHUNK_FRAMES * CHANNELS),
@@ -534,7 +581,7 @@ impl Engine {
                     offset,
                     next: self.next_calib,
                     valid: 0,
-                    ev: StereoEvidence::new(self.cfg.max_verify_sub_blocks),
+                    ev: StereoEvidence::new(self.cfg.max_verify_sub_blocks, self.cfg.residual_lags),
                 });
             }
             AlignOutcome::Rejected { reason, mismatch } => {
@@ -698,9 +745,12 @@ impl Engine {
     /// Per-channel unity-gain ratio and fractional-delay projection of `C − R` over one sub-block.
     fn measure(&self, start: u64, len: usize, offset: i64) -> [ChannelFit; 2] {
         let min_energy = len as f64 * self.cfg.min_ref_rms * self.cfg.min_ref_rms;
-        let mut fit = [ChannelFit::default(); 2];
+        let lags = self.cfg.residual_lags;
+        let mut fit = [ChannelFit::default(), ChannelFit::default()];
+        let mut proj = vec![0.0f64; 2 * lags];
         for (ch, out) in fit.iter_mut().enumerate() {
             let (mut a, mut x, mut d, mut y) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            proj.iter_mut().for_each(|p| *p = 0.0);
             for n in 0..len as u64 {
                 let i = start + n;
                 let j = (i as i64 + offset) as u64;
@@ -711,22 +761,30 @@ impl Engine {
                 x += c * r;
                 d += rp * rp;
                 y += (c - r) * rp;
+                let res = c - r;
+                for (slot, p) in proj.iter_mut().enumerate() {
+                    let k = residual_lag(slot, lags);
+                    *p += res * f64::from(self.rf.ring.frame((j as i64 + k) as u64)[ch]);
+                }
             }
             if a >= min_energy {
                 out.gain = Some(x / a);
                 if d > a * 1e-9 {
                     out.delay = Some(y / d);
                 }
+                out.residual = proj.iter().map(|p| p / a).collect();
             }
         }
         fit
     }
 
-    /// Whether a sub-block at `start` for `offset` is fully inside both rings (with ±1 reference
-    /// frames for the derivative). `None` = not yet available, `Some(false)` = history lost.
+    /// Whether a sub-block at `start` for `offset` is fully inside both rings (with the reference
+    /// margin the derivative and residual lags read). `None` = not yet available, `Some(false)` =
+    /// history lost.
     fn sub_block_ready(&self, start: u64, len: usize, offset: i64) -> Option<bool> {
-        let a = start as i64 + offset - 1;
-        let b = start as i64 + offset + len as i64 + 1;
+        let margin = self.cfg.residual_lags.max(1) as i64;
+        let a = start as i64 + offset - margin;
+        let b = start as i64 + offset + len as i64 + margin;
         if start + len as u64 > self.ep.ring.end() || b > self.rf.ring.end() as i64 {
             return None;
         }
@@ -759,12 +817,12 @@ impl Engine {
             match cand.ev.verdict(&self.cfg, self.cfg.verify_z) {
                 Verdict::Accept => return self.lock(),
                 Verdict::Reject => {
-                    let why = format!("candidate offset {offset} failed the unity check on held-out audio ({})", cand.ev.describe());
+                    let why = format!("candidate offset {offset} failed the unity check on held-out audio ({})", cand.ev.describe(self.cfg.residual_lags));
                     self.drop_candidate(why, true);
                     return self.check_align_timeout();
                 }
                 Verdict::Inconclusive if cand.valid >= self.cfg.max_verify_sub_blocks => {
-                    let why = format!("candidate offset {offset} stayed inconclusive ({})", cand.ev.describe());
+                    let why = format!("candidate offset {offset} stayed inconclusive ({})", cand.ev.describe(self.cfg.residual_lags));
                     self.drop_candidate(why, false);
                     return self.check_align_timeout();
                 }
@@ -797,7 +855,8 @@ impl Engine {
         if self.mismatches >= 2 {
             return Err(self.fail(format!(
                 "no unity-gain integer offset could be verified in {secs:.1} s of own audio; the endpoint \
-                 does not carry a sample-identical copy of the reference (format/DSP/route mismatch). Last: {last}"
+                 does not carry a sample-identical copy of the reference (format/DSP/route mismatch, or an \
+                 audio enhancement on the output device). Last: {last}"
             )));
         }
         self.status.reason = format!(
@@ -829,7 +888,7 @@ impl Engine {
         self.status.reason = format!(
             "locked at offset {} frames (content vs packet timing {bias:+.0}); {}",
             cand.offset,
-            cand.ev.describe()
+            cand.ev.describe(self.cfg.residual_lags)
         );
         self.monitor_next = self.out_next;
         self.monitor.clear();
@@ -933,14 +992,14 @@ impl Engine {
             }
             // Non-overlapping windows: judge, then start a fresh one.
             let verdict = self.monitor.verdict(&self.cfg, self.cfg.monitor_z);
-            let described = self.monitor.describe();
+            let described = self.monitor.describe(self.cfg.residual_lags);
             self.monitor.clear();
             self.monitor_fresh = 0;
             if verdict == Verdict::Reject {
                 self.monitor_rejects += 1;
                 if self.monitor_rejects >= self.cfg.monitor_consecutive {
                     return Err(self.fail(format!(
-                        "lost lock at offset {offset}: the endpoint no longer carries the reference at unity gain ({described})"
+                        "lost lock at offset {offset}: the endpoint no longer carries a sample-identical copy of the reference ({described})"
                     )));
                 }
             } else {

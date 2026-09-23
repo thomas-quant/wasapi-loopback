@@ -63,6 +63,10 @@ struct Scenario {
     bias: i64,
     gain: f32,
     swap: bool,
+    /// Extra own-audio taps `(lag, coefficient)` on the endpoint path from wall `taps_from` on:
+    /// an endpoint effect the reference never sees.
+    taps: Vec<(i64, f32)>,
+    taps_from: i64,
     ep: LegPlan,
     rf: LegPlan,
     end: i64,
@@ -79,6 +83,8 @@ impl Scenario {
             bias,
             gain: 1.0,
             swap: false,
+            taps: vec![],
+            taps_from: i64::MIN,
             ep: LegPlan::new(7_000, &[480], 240),
             rf: LegPlan::new(0, &[480], 480),
             end: 6 * F,
@@ -89,7 +95,13 @@ impl Scenario {
 
     fn endpoint_sample(&self, w: i64, ch: usize) -> f32 {
         let och = if self.swap { 1 - ch } else { ch };
-        (self.other)(w, ch) + self.gain * (self.own)(w + self.bias, och)
+        let mut own = (self.own)(w + self.bias, och);
+        if w >= self.taps_from {
+            for (lag, c) in &self.taps {
+                own += c * (self.own)(w + self.bias + lag, och);
+            }
+        }
+        (self.other)(w, ch) + self.gain * own
     }
 }
 
@@ -444,6 +456,41 @@ fn a_non_unity_path_is_rejected_not_fitted() {
     assert!(r.out.iter().all(|f| *f == [0.0, 0.0]));
     let f = r.fault.clone().expect("aligning must time out");
     assert!(f.0.contains("unity"), "{}", f.0);
+}
+
+/// Symmetric taps at ±4 frames: own audio is a 4-tap moving average, uncorrelated with itself four
+/// frames away, so the unity-gain ratio reads exactly 1 and the fractional-delay projection 0 — yet
+/// subtraction would leave the taps (≈ −13 dB of own audio) audible. An endpoint effect like this
+/// must never be subtracted as if it were an identical copy.
+fn filtered_path(sc: &mut Scenario) {
+    sc.taps = vec![(-4, 0.15), (4, 0.15)];
+}
+
+#[test]
+fn a_filtered_path_with_unity_gain_and_zero_delay_is_rejected_not_subtracted() {
+    let mut sc = Scenario::new(1024);
+    filtered_path(&mut sc);
+    sc.cfg.align_timeout_frames = 3 * F as u64;
+    sc.end = 10 * F;
+    let r = run(&sc);
+    assert!(!r.ran && r.status.locks == 0, "{:#?}", r.status);
+    assert!(r.out.iter().all(|f| *f == [0.0, 0.0]));
+    let f = r.fault.clone().expect("aligning must time out on conclusive mismatches");
+    assert!(f.0.contains("sample-identical") && f.0.contains("residual"), "{}", f.0);
+}
+
+#[test]
+fn an_endpoint_effect_that_appears_after_the_lock_is_caught_as_lost_lock() {
+    let mut sc = Scenario::new(1024);
+    filtered_path(&mut sc);
+    sc.taps_from = 4 * F;
+    sc.end = 10 * F;
+    let r = run(&sc);
+    assert!(r.status.locks >= 1);
+    assert_no_leak(&sc, &r, Some(4 * F));
+    let f = r.fault.clone().expect("the monitor must notice the new endpoint effect");
+    assert!(f.0.contains("lost lock") && f.0.contains("residual"), "{}", f.0);
+    assert!(f.0.contains("at lag +4") || f.0.contains("at lag -4"), "the report names the effect's lag: {}", f.0);
 }
 
 #[test]
